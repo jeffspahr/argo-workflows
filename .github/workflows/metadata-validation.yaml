@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 80bb477650188f03f42e20a1cb75099be69d1104
+          ref: 5442437f108856f4f184b944c34bfec04b6412ea
           path: source
           fetch-depth: 0
           persist-credentials: false
@@ -86,4 +86,50 @@ jobs:
         with:
           name: metadata-${{ matrix.target }}-${{ github.run_attempt }}
           path: evidence
+          retention-days: 14
+  upstream-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 5442437f108856f4f184b944c34bfec04b6412ea
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.15'
+      - name: Prepare upstream tool prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz unzip
+          curl -fsSL --retry 5 https://github.com/protocolbuffers/protobuf/releases/download/v3.19.4/protoc-3.19.4-linux-x86_64.zip -o "$RUNNER_TEMP/protoc.zip"
+          sudo unzip -o "$RUNNER_TEMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+          npm install -g yarn
+          mkdir -p /home/runner/go/src/github.com/argoproj
+          ln -s "$PWD" /home/runner/go/src/github.com/argoproj/argo-workflows
+      - name: Run regression and complete upstream pre-commit
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          ARGO_METADATA_DOCKER_TEST=1 python3 -m unittest discover -s hack -p 'build_metadata_test.py' -v 2>&1 | tee "$RUNNER_TEMP/evidence/regression.log"
+          make pre-commit -B 2>&1 | tee "$RUNNER_TEMP/evidence/precommit.log"
+          git diff --exit-code
+      - name: Capture generated diff
+        if: always()
+        run: git diff > "$RUNNER_TEMP/evidence/generated.diff"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: upstream-checks-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
           retention-days: 14
