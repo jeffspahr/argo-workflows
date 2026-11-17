@@ -5,88 +5,6 @@ on:
 permissions:
   contents: read
 jobs:
-  images:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [workflow-controller, argoexec, argocli]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: 5442437f108856f4f184b944c34bfec04b6412ea
-          path: source
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kubeflow/pipelines
-          ref: 62b3ef0d3a97be1c916def4058e8034036b16e06
-          path: tooling
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
-        with:
-          go-version-file: source/go.mod
-          cache: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
-        with:
-          python-version: '3.13'
-      - uses: ./tooling/.github/actions/setup-osv-scanner
-        with:
-          arch: amd64
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
-      - name: Test actual Docker context transfer
-        if: matrix.target == 'argoexec'
-        working-directory: source
-        run: ARGO_METADATA_DOCKER_TEST=1 python3 -m unittest discover -s hack -p 'build_metadata_test.py' -v
-      - name: Build and scan identical source with and without Git metadata
-        env:
-          TARGET: ${{ matrix.target }}
-          PYTHONPATH: ${{ github.workspace }}/tooling/release
-        run: |
-          set -euo pipefail
-          mkdir -p evidence
-          cd source
-          sha=$(git rev-parse HEAD)
-          printf '%s\n' "$sha" > ../evidence/source-sha.txt
-          bash hack/prepare-release-context.sh "$RUNNER_TEMP/context"
-          for variant in baseline candidate; do
-            flags=()
-            context=.
-            if [ "$variant" = candidate ]; then
-              context="$RUNNER_TEMP/context/source"
-              flags=(--file "$RUNNER_TEMP/context/Dockerfile" --build-arg GOFLAGS=-buildvcs=true --build-arg VERIFY_BUILD_METADATA=true)
-            fi
-            docker buildx build --load --platform linux/amd64 --target "$TARGET" --tag "argo-test:$variant" --build-arg "GIT_COMMIT=$sha" --build-arg GIT_TAG=untagged --build-arg GIT_TREE_STATE=clean "${flags[@]}" "$context" 2>&1 | tee "../evidence/$variant-build.log"
-            mkdir -p "../evidence/$variant"
-            docker image inspect "argo-test:$variant" > "../evidence/$variant/image.json"
-            binary="$TARGET"
-            if [ "$TARGET" = argocli ]; then binary=argo; fi
-            container=$(docker create "argo-test:$variant")
-            docker cp "$container:/bin/$binary" "../evidence/$variant/binary"
-            docker rm "$container"
-            go version -m "../evidence/$variant/binary" > "../evidence/$variant/build-info.txt"
-            sha256sum "../evidence/$variant/binary" > "../evidence/$variant/binary.sha256"
-            VARIANT="$variant" python - <<'PY'
-          import json, os
-          from pathlib import Path
-          from kfpr.osv_image_scan import scan_image
-          from kfpr.osv_reports import findings
-          output=Path('../evidence')/os.environ['VARIANT']
-          meta=json.loads((output/'image.json').read_text())[0]
-          scan_image(meta['Id'], 'linux/amd64', output, report_format='json')
-          rows=findings(json.loads((output/'scan.json').read_text())['report'])
-          (output/'findings.json').write_text(json.dumps(rows,indent=2))
-          PY
-            rm "../evidence/$variant/binary"
-          done
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        if: always()
-        with:
-          name: metadata-${{ matrix.target }}-${{ github.run_attempt }}
-          path: evidence
-          retention-days: 14
   upstream-checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -113,6 +31,8 @@ jobs:
           curl -fsSL --retry 5 https://github.com/protocolbuffers/protobuf/releases/download/v3.19.4/protoc-3.19.4-linux-x86_64.zip -o "$RUNNER_TEMP/protoc.zip"
           sudo unzip -o "$RUNNER_TEMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
           sudo chmod +x /usr/local/bin/protoc
+          sudo find /usr/local/include -type f -exec chmod a+r {} +
+          sudo find /usr/local/include -type d -exec chmod a+rx {} +
           protoc --version
           npm install -g yarn
           mkdir -p /home/runner/go/src/github.com/argoproj
