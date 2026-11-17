@@ -1,0 +1,122 @@
+name: Argo build metadata validation
+on:
+  push:
+    branches: [codex/argo-build-metadata-validation]
+permissions:
+  contents: read
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [workflow-controller, argoexec, argocli]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: f415fcea3c6a5ba926485b7c82b238dd25c13066
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: kubeflow/pipelines
+          ref: 62b3ef0d3a97be1c916def4058e8034036b16e06
+          path: tooling
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.13'
+      - uses: ./tooling/.github/actions/setup-osv-scanner
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Build and scan identical source with and without Git metadata
+        env:
+          TARGET: ${{ matrix.target }}
+          PYTHONPATH: ${{ github.workspace }}/tooling/release
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd source
+          sha=$(git rev-parse HEAD)
+          printf '%s\n' "$sha" > ../evidence/source-sha.txt
+          bash hack/prepare-release-context.sh "$RUNNER_TEMP/context"
+          for variant in baseline candidate; do
+            flags=()
+            context=.
+            if [ "$variant" = candidate ]; then
+              context="$RUNNER_TEMP/context/source"
+              flags=(--file "$RUNNER_TEMP/context/Dockerfile" --build-arg GOFLAGS=-buildvcs=true --build-arg VERIFY_BUILD_METADATA=true)
+            fi
+            docker buildx build --load --platform linux/amd64 --target "$TARGET" --tag "argo-test:$variant" --build-arg "GIT_COMMIT=$sha" --build-arg GIT_TAG=untagged --build-arg GIT_TREE_STATE=clean "${flags[@]}" "$context" 2>&1 | tee "../evidence/$variant-build.log"
+            mkdir -p "../evidence/$variant"
+            docker image inspect "argo-test:$variant" > "../evidence/$variant/image.json"
+            binary="$TARGET"
+            if [ "$TARGET" = argocli ]; then binary=argo; fi
+            container=$(docker create "argo-test:$variant")
+            docker cp "$container:/bin/$binary" "../evidence/$variant/binary"
+            docker rm "$container"
+            go version -m "../evidence/$variant/binary" > "../evidence/$variant/build-info.txt"
+            sha256sum "../evidence/$variant/binary" > "../evidence/$variant/binary.sha256"
+            VARIANT="$variant" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from kfpr.osv_image_scan import scan_image
+          from kfpr.osv_reports import findings
+          output=Path('../evidence')/os.environ['VARIANT']
+          meta=json.loads((output/'image.json').read_text())[0]
+          scan_image(meta['Id'], 'linux/amd64', output, report_format='json')
+          rows=findings(json.loads((output/'scan.json').read_text())['report'])
+          (output/'findings.json').write_text(json.dumps(rows,indent=2))
+          PY
+            rm "../evidence/$variant/binary"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: metadata-${{ matrix.target }}-${{ github.run_attempt }}
+          path: evidence
+          retention-days: 14
+  upstream-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: f415fcea3c6a5ba926485b7c82b238dd25c13066
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '20'
+      - name: Prepare upstream tool prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz protobuf-compiler
+          npm install -g yarn
+          mkdir -p /home/runner/go/src/github.com/argoproj
+          ln -s "$PWD" /home/runner/go/src/github.com/argoproj/argo-workflows
+      - name: Run regression and complete upstream pre-commit
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 -m unittest discover -s hack -p 'build_metadata_test.py' -v 2>&1 | tee "$RUNNER_TEMP/evidence/regression.log"
+          make pre-commit -B 2>&1 | tee "$RUNNER_TEMP/evidence/precommit.log"
+          git diff --exit-code
+      - name: Capture generated diff
+        if: always()
+        run: git diff > "$RUNNER_TEMP/evidence/generated.diff"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: upstream-checks-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
