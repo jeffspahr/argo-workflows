@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: f415fcea3c6a5ba926485b7c82b238dd25c13066
+          ref: 80bb477650188f03f42e20a1cb75099be69d1104
           path: source
           fetch-depth: 0
           persist-credentials: false
@@ -36,6 +36,10 @@ jobs:
         with:
           arch: amd64
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Test actual Docker context transfer
+        if: matrix.target == 'argoexec'
+        working-directory: source
+        run: ARGO_METADATA_DOCKER_TEST=1 python3 -m unittest discover -s hack -p 'build_metadata_test.py' -v
       - name: Build and scan identical source with and without Git metadata
         env:
           TARGET: ${{ matrix.target }}
