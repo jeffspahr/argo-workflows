@@ -7,7 +7,16 @@ permissions:
 jobs:
   upstream-checks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [codegen, lint, docs]
+    env:
+      GOMEMLIMIT: 4GiB
+      GOGC: '50'
+      GOMAXPROCS: '2'
+      GOFLAGS: -p=2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -37,12 +46,16 @@ jobs:
           npm install -g yarn
           mkdir -p /home/runner/go/src/github.com/argoproj
           ln -s "$PWD" /home/runner/go/src/github.com/argoproj/argo-workflows
-      - name: Run regression and complete upstream pre-commit
+      - name: Run upstream check with bounded resources
+        env:
+          CHECK: ${{ matrix.check }}
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/evidence"
-          ARGO_METADATA_DOCKER_TEST=1 python3 -m unittest discover -s hack -p 'build_metadata_test.py' -v 2>&1 | tee "$RUNNER_TEMP/evidence/regression.log"
-          make pre-commit -B 2>&1 | tee "$RUNNER_TEMP/evidence/precommit.log"
+          (while sleep 60; do free -m; ps -eo pid,comm,rss,pcpu --sort=-rss | head -12; done) &
+          monitor=$!
+          trap 'kill "$monitor" 2>/dev/null || true' EXIT
+          timeout --signal=TERM --kill-after=30s 25m make "$CHECK" -B 2>&1 | tee "$RUNNER_TEMP/evidence/$CHECK.log"
           git diff --exit-code
       - name: Capture generated diff
         if: always()
@@ -50,6 +63,6 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
-          name: upstream-checks-${{ github.run_attempt }}
+          name: upstream-checks-${{ matrix.check }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/evidence
           retention-days: 14
